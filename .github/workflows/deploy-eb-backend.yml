@@ -1,0 +1,72 @@
+name: Deploy backend to Elastic Beanstalk
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Install backend deps only (we deploy only /backend to EB)
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci || npm install
+
+      # Zip ONLY the backend folder so package.json is at the zip root from EB's POV
+      - name: Create deployment bundle
+        working-directory: backend
+        run: |
+          zip -r ../app.zip . -x "node_modules/*" ".git/*" "*.log" ".github/*"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Get AWS Account ID & ensure artifact bucket
+        id: bucket
+        shell: bash
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="spj-ai-dashboard-artifacts-$ACCOUNT_ID-${{ secrets.AWS_REGION }}"
+          echo "bucket=$BUCKET" >> $GITHUB_OUTPUT
+
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            if [ "${{ secrets.AWS_REGION }}" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" --region ${{ secrets.AWS_REGION }} \
+                --create-bucket-configuration LocationConstraint=${{ secrets.AWS_REGION }}
+            fi
+          fi
+
+      - name: Upload & deploy to Elastic Beanstalk
+        shell: bash
+        run: |
+          APP="${{ secrets.EB_APP_NAME }}"
+          ENV="${{ secrets.EB_ENV_NAME }}"
+          BUCKET="${{ steps.bucket.outputs.bucket }}"
+          KEY="app-$(date +%Y%m%d%H%M%S).zip"
+
+          aws s3 cp app.zip "s3://$BUCKET/$KEY"
+
+          aws elasticbeanstalk create-application-version \
+            --application-name "$APP" \
+            --version-label "$KEY" \
+            --source-bundle S3Bucket="$BUCKET",S3Key="$KEY"
+
+          aws elasticbeanstalk update-environment \
+            --environment-name "$ENV" \
+            --version-label "$KEY"
